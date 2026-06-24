@@ -1,274 +1,253 @@
 #include "PutinShieldTemplate.h"
-LARGE_INTEGER g_CallbackRegistrationCookie;
+#include "dkom.h"
 
-typedef struct _PROCESS_TOKEN_ENTRY {
-	LIST_ENTRY ListEntry;    
-	HANDLE ProcessId;       
-	PACCESS_TOKEN OrigToken;  
-} PROCESS_TOKEN_ENTRY, * PPROCESS_TOKEN_ENTRY;
-
-LIST_ENTRY TargetProcessListHead;
-FAST_MUTEX ProcessListMutex;
-
-
-// =================================================================
-
-VOID ThreadNotifyRoutine(_In_ HANDLE ProcessId, _In_ HANDLE ThreadId, _In_ BOOLEAN Create)
+namespace shield::core 
 {
-	if (Create)
-	{
-		PEPROCESS EPROCESS = NULL;
-		if (NT_SUCCESS(PsLookupProcessByProcessId(ProcessId, &EPROCESS)))
-		{
-			PACCESS_TOKEN threadStartToken = PsReferencePrimaryToken(EPROCESS);
-			if (threadStartToken != NULL)
-			{
-				ExAcquireFastMutex(&ProcessListMutex);
+    struct ProcessTokenEntry
+    {
+        LIST_ENTRY ListEntry;
+        HANDLE ProcessId;
+        PACCESS_TOKEN OrigToken;
+    };
 
-				PLIST_ENTRY link = TargetProcessListHead.Flink;
-				while (link != &TargetProcessListHead)
-				{
-					PPROCESS_TOKEN_ENTRY entry = CONTAINING_RECORD(link, PROCESS_TOKEN_ENTRY, ListEntry);
+    struct LoadedImageEntry
+    {
+        LIST_ENTRY ListEntry;
+        HANDLE ProcessId;
+        PVOID ImageBase;
+        SIZE_T ImageSize;
+        UNICODE_STRING ImagePath;
+    };
 
-					if (entry->ProcessId == ProcessId)
-					{
-						if (entry->OrigToken != threadStartToken)
-						{
-							KdPrint(("thread stealing detected %p\n", ProcessId, entry->OrigToken, threadStartToken));
+     LIST_ENTRY TargetProcessListHead;
+     FAST_MUTEX ProcessListMutex;
+     LIST_ENTRY LoadedImageListHead;
+     FAST_MUTEX ImageListMutex;
+     UNICODE_STRING symLinkName;
 
-						}
-						break;
-					}
-					link = link->Flink;
-				}
+    void handle_process_stop(HANDLE process_id) {
+        ExAcquireFastMutex(&ProcessListMutex);
+        PLIST_ENTRY link = TargetProcessListHead.Flink;
 
-				ExReleaseFastMutex(&ProcessListMutex);
-				PsDereferencePrimaryToken(threadStartToken);
-			}
-			ObDereferenceObject(EPROCESS);
-		}
-	}
-	else
-	{
-		KdPrint(("thread disable ID: %p in process ID: %p\n", ThreadId, ProcessId));
-	}
+        while (link != &TargetProcessListHead) {
+            auto* entry = CONTAINING_RECORD(link, ProcessTokenEntry, ListEntry);
+            if (entry->ProcessId == process_id) {
+                RemoveEntryList(link);
+                PsDereferencePrimaryToken(entry->OrigToken);
+                ExFreePoolWithTag(entry, 'shld');
+                KdPrint(("process %p stopped...\n", process_id));
+                break; // not uaf
+            }
+            link = link->Flink;
+        }
+        ExReleaseFastMutex(&ProcessListMutex);
+    }
 }
 
-// =================================================================
-void ANTI_TOKEN_GET_EXPLOIT(HANDLE ParentId, HANDLE ProcessId)
+NTSTATUS shield::getdriverlist::driverlist(PUNICODE_STRING DriverName, PIMAGE_INFO ImageInfo)
 {
-	UNREFERENCED_PARAMETER(ParentId);
+    if (!DriverName || !DriverName->Buffer || DriverName->Length == 0 || !ImageInfo)
+    {
+        return STATUS_SUCCESS;
+    }
+    KdPrint(("processing driver %wZ at addr %p\n", DriverName, ImageInfo->ImageBase));
 
-	PEPROCESS EPROCESS = NULL;
-	NTSTATUS EPROCESS_FUNC = PsLookupProcessByProcessId(ProcessId, &EPROCESS);
+    for (ULONG i = 0; i < BLACKLIST_COUNT; i++)
+    {
+        UNICODE_STRING blacklist;
+        RtlInitUnicodeString(&blacklist, BlackListNames[i]);
 
-	if (NT_SUCCESS(EPROCESS_FUNC))
-	{
-		PACCESS_TOKEN savetoken = PsReferencePrimaryToken(EPROCESS);
-		if (savetoken != NULL)
-		{
-			PPROCESS_TOKEN_ENTRY entry = (PPROCESS_TOKEN_ENTRY)ExAllocatePool2(POOL_FLAG_NON_PAGED, sizeof(PROCESS_TOKEN_ENTRY), 'shld');
-
-			if (entry != NULL)
-			{
-				entry->ProcessId = ProcessId;
-				entry->OrigToken = savetoken;
-
-				ExAcquireFastMutex(&ProcessListMutex);
-				InsertTailList(&TargetProcessListHead, &entry->ListEntry);
-				ExReleaseFastMutex(&ProcessListMutex);
-
-				KdPrint(("processe %p token saved: %p\n", ProcessId, savetoken));
-			}
-			else
-			{
-				PsDereferencePrimaryToken(savetoken);
-			}
-		}
-		ObDereferenceObject(EPROCESS);
-	}
-}
-// =================================================================
-
-// =================================================================
-VOID ProcessCreateNotifyRoutineEx(IN OUT PEPROCESS Process, IN HANDLE ProcessId, IN OUT PPS_CREATE_NOTIFY_INFO CreateInfo)
-{
-	UNREFERENCED_PARAMETER(Process);
-	if (CreateInfo != NULL)
-	{
-		ANTI_TOKEN_GET_EXPLOIT(CreateInfo->ParentProcessId, ProcessId);
-
-	}
-	else
-	{
-		// Åñëè CreateInfo == NULL, çíà÷èò ïðîöåññ ÇÀÂÅÐØÀÅÒÑß
-		PutinHandleProcessStop(ProcessId);
-	}
+        if (RtlCompareUnicodeString(DriverName, &blacklist, TRUE) == 0)
+        {
+            return STATUS_ACCESS_DENIED;
+        }
+    }
+    return STATUS_SUCCESS;
 }
 
-//NTSTATUS REESTERSCALLBACK(
-//	_In_ PVOID CallbackContext,
-//	_In_opt_ PVOID Argument1,
-//	_In_opt_ PVOID Argument2
-//)
-//{
-//
-//	return STATUS_SUCCESS;
-//}
 
-void PutinHandleProcessStop(HANDLE ProcessId)
-{
-	ExAcquireFastMutex(&ProcessListMutex);
+void shield::anti_exploit::check_thread_token(HANDLE process_id) {
+        PEPROCESS eprocess = nullptr;
+        if (NT_SUCCESS(PsLookupProcessByProcessId(process_id, &eprocess))) {
+            PACCESS_TOKEN current_token = PsReferencePrimaryToken(eprocess);
 
-	PLIST_ENTRY link = TargetProcessListHead.Flink;
-	while (link != &TargetProcessListHead)
-	{
-		PPROCESS_TOKEN_ENTRY entry = CONTAINING_RECORD(link, PROCESS_TOKEN_ENTRY, ListEntry);
+            if (current_token != nullptr) {
+                ExAcquireFastMutex(&core::ProcessListMutex);
 
-		if (entry->ProcessId == ProcessId)
-		{
-			RemoveEntryList(link);
-			PsDereferencePrimaryToken(entry->OrigToken);
-			ExFreePoolWithTag(entry, 'shld');
+                PLIST_ENTRY link = core::TargetProcessListHead.Flink;
+                while (link != &core::TargetProcessListHead) {
+                    auto* entry = CONTAINING_RECORD(link, core::ProcessTokenEntry, ListEntry);
+                    if (entry->ProcessId == process_id) {
+                        if (entry->OrigToken != current_token) {
+                            KdPrint(("steal detected pid: %p\n", process_id));
+                        }
+                        break;
+                    }
+                    link = link->Flink;
+                }
+                ExReleaseFastMutex(&core::ProcessListMutex);
+                PsDereferencePrimaryToken(current_token);
+            }
+            ObDereferenceObject(eprocess);
+        }
+    }
 
-			KdPrint(("process %p stopped...\n", ProcessId));
-			break;
-		}
-		link = link->Flink;
-	}
-	ExReleaseFastMutex(&ProcessListMutex);
+void shield::anti_exploit::save_original_token(HANDLE process_id) {
+        PEPROCESS eprocess = nullptr;
+        if (NT_SUCCESS(PsLookupProcessByProcessId(process_id, &eprocess))) {
+            PACCESS_TOKEN token = PsReferencePrimaryToken(eprocess);
+            if (token != nullptr) {
+                auto* entry = static_cast<core::ProcessTokenEntry*>(ExAllocatePool2(POOL_FLAG_NON_PAGED, sizeof(core::ProcessTokenEntry), 'shld'));
+
+                if (entry != nullptr) {
+                    entry->ProcessId = process_id;
+                    entry->OrigToken = token;
+
+                    ExAcquireFastMutex(&core::ProcessListMutex);
+                    InsertTailList(&core::TargetProcessListHead, &entry->ListEntry);
+                    ExReleaseFastMutex(&core::ProcessListMutex);
+                }
+                else {
+                    PsDereferencePrimaryToken(token);
+                }
+            }
+            ObDereferenceObject(eprocess);
+        }
+    }
+
+void shield::monitor::save_loaded_image(PUNICODE_STRING image_name, HANDLE process_id, PIMAGE_INFO image_info) {
+        if (!image_name || !image_name->Buffer || image_name->Length == 0 || !image_info) return;
+
+        auto* entry = static_cast<core::LoadedImageEntry*>(ExAllocatePool2(POOL_FLAG_NON_PAGED, sizeof(core::LoadedImageEntry), 'shld'));
+        if (!entry) return;
+
+        entry->ImagePath.Buffer = static_cast<PWCH>(
+            ExAllocatePool2(POOL_FLAG_NON_PAGED, image_name->Length, 'strT')
+            );
+        if (!entry->ImagePath.Buffer) {
+            ExFreePoolWithTag(entry, 'shld'); 
+            return;
+        }
+
+        entry->ProcessId = process_id;
+        entry->ImageBase = image_info->ImageBase;
+        entry->ImageSize = image_info->ImageSize;
+        entry->ImagePath.Length = image_name->Length;
+        entry->ImagePath.MaximumLength = image_name->Length;
+        RtlCopyMemory(entry->ImagePath.Buffer, image_name->Buffer, image_name->Length);
+
+        ExAcquireFastMutex(&core::ImageListMutex);
+        InsertTailList(&core::LoadedImageListHead, &entry->ListEntry);
+        ExReleaseFastMutex(&core::ImageListMutex);
+
+        KdPrint(("image saved: PID %p, Path %wZ\n", process_id, &entry->ImagePath));
+}
+
+VOID ThreadNotifyRoutine(_In_ HANDLE ProcessId, _In_ HANDLE ThreadId, _In_ BOOLEAN Create) {
+    UNREFERENCED_PARAMETER(ThreadId);
+    if (Create) 
+    {
+        shield::anti_exploit::check_thread_token(ProcessId);
+    }
+}
+
+VOID ProcessCreateNotifyRoutineEx(IN OUT PEPROCESS Process, IN HANDLE ProcessId, IN OUT PPS_CREATE_NOTIFY_INFO CreateInfo) {
+    UNREFERENCED_PARAMETER(Process);
+    if (CreateInfo != nullptr) 
+    {
+        shield::anti_exploit::save_original_token(ProcessId);
+    }
+    else 
+    {
+        shield::core::handle_process_stop(ProcessId);
+    }
+}
+
+VOID ImageLoadNotifyRoutine(_In_ PUNICODE_STRING FullImageName, _In_ HANDLE ProcessId, _In_ PIMAGE_INFO ImageInfo) {
+    shield::monitor::save_loaded_image(FullImageName, ProcessId, ImageInfo);
+    NTSTATUS getdriver = shield::getdriverlist::driverlist(FullImageName, ImageInfo);
+    if (!NT_SUCCESS(getdriver))
+    {
+        KdPrint(("driver block...\n"));
+    }
+}
+
+
+NTSTATUS IRPCREATECLOSE(PDEVICE_OBJECT, PIRP Irp) {
+    Irp->IoStatus.Status = STATUS_SUCCESS;
+    Irp->IoStatus.Information = 0;
+    IoCompleteRequest(Irp, IO_NO_INCREMENT);
+    return STATUS_SUCCESS;
+}
+
+NTSTATUS DeviceControl(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
+    UNREFERENCED_PARAMETER(DeviceObject);
+
+    PIO_STACK_LOCATION ioStack = IoGetCurrentIrpStackLocation(Irp);
+
+    NTSTATUS status = (ioStack->Parameters.DeviceIoControl.IoControlCode == IOCTL_PUTIN_SHIELD_START_PROTECTION ||
+        ioStack->Parameters.DeviceIoControl.IoControlCode == IOCTL_PUTIN_SHIELD_STOP_PROTECTION)
+        ? STATUS_SUCCESS : STATUS_INVALID_DEVICE_REQUEST;
+
+    Irp->IoStatus.Status = status;
+    Irp->IoStatus.Information = 0;
+
+    IoCompleteRequest(Irp, IO_NO_INCREMENT);
+
+    return status;
 }
 
 void PutinDriverUnload(_In_ PDRIVER_OBJECT DriverObject) {
-	UNREFERENCED_PARAMETER(DriverObject);
+    PsSetCreateProcessNotifyRoutineEx(ProcessCreateNotifyRoutineEx, TRUE);
+    PsRemoveCreateThreadNotifyRoutine(ThreadNotifyRoutine);
 
-	PsSetCreateProcessNotifyRoutineEx(ProcessCreateNotifyRoutineEx, TRUE);
-	PsRemoveCreateThreadNotifyRoutine(ThreadNotifyRoutine);
+    ExAcquireFastMutex(&shield::core::ProcessListMutex);
+    while (!IsListEmpty(&shield::core::TargetProcessListHead)) {
+        PLIST_ENTRY link = RemoveHeadList(&shield::core::TargetProcessListHead);
+        auto* entry = CONTAINING_RECORD(link, shield::core::ProcessTokenEntry, ListEntry);
+        if (entry->OrigToken != nullptr) {
+            PsDereferencePrimaryToken(entry->OrigToken);
+        }
+        ExFreePoolWithTag(entry, 'shld');
+    }
+    ExReleaseFastMutex(&shield::core::ProcessListMutex);
 
-	ExAcquireFastMutex(&ProcessListMutex);
-	while (!IsListEmpty(&TargetProcessListHead))
-	{
-		PLIST_ENTRY link = RemoveHeadList(&TargetProcessListHead);
-		PPROCESS_TOKEN_ENTRY entry = CONTAINING_RECORD(link, PROCESS_TOKEN_ENTRY, ListEntry);
-
-		if (entry->OrigToken != NULL) 
-		{
-			PsDereferencePrimaryToken(entry->OrigToken);
-		}
-
-		ExFreePoolWithTag(entry, 'shld');
-	}
-	ExReleaseFastMutex(&ProcessListMutex);
-
-	IoDeleteSymbolicLink(&symLinkName);
-
-	if (DriverObject->DeviceObject != nullptr)
-	{
-		IoDeleteDevice(DriverObject->DeviceObject);
-	}
-
-	KdPrint(("driver unload\n"));
+    IoDeleteSymbolicLink(&shield::core::symLinkName);
+    if (DriverObject->DeviceObject != nullptr) {
+        IoDeleteDevice(DriverObject->DeviceObject);
+    }
+    KdPrint(("driver unload\n"));
 }
 
+extern "C" NTSTATUS DriverEntry(_In_ PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath) {
+    UNREFERENCED_PARAMETER(RegistryPath);
+    DriverObject->DriverUnload = PutinDriverUnload;
 
-NTSTATUS DeviceControl(PDEVICE_OBJECT DeviceObject, PIRP Irp)
-{
-	UNREFERENCED_PARAMETER(DeviceObject);
+    UNICODE_STRING deviceName;
+    RtlInitUnicodeString(&deviceName, L"\\Device\\PutinShield");
 
-	PIO_STACK_LOCATION ioStack = IoGetCurrentIrpStackLocation(Irp);
-	NTSTATUS status = STATUS_SUCCESS;
+    PDEVICE_OBJECT deviceObject = nullptr;
+    NTSTATUS status = IoCreateDevice(DriverObject, sizeof(ULONG), &deviceName, FILE_DEVICE_UNKNOWN, 0, FALSE, &deviceObject);
+    if (!NT_SUCCESS(status)) return status;
 
-	ULONG ioControlCode = ioStack->Parameters.DeviceIoControl.IoControlCode;
+    RtlInitUnicodeString(&shield::core::symLinkName, L"\\DosDevices\\PutinShieldLink");
+    status = IoCreateSymbolicLink(&shield::core::symLinkName, &deviceName);
+    if (!NT_SUCCESS(status)) {
+        IoDeleteDevice(deviceObject);
+        return status;
+    }
 
-	switch (ioControlCode)
-	{
-	case IOCTL_PUTIN_SHIELD_START_PROTECTION:
+    DriverObject->MajorFunction[IRP_MJ_CREATE] = IRPCREATECLOSE;
+    DriverObject->MajorFunction[IRP_MJ_CLOSE] = IRPCREATECLOSE;
+    DriverObject->MajorFunction[IRP_MJ_DEVICE_CONTROL] = DeviceControl;
 
-		break;
+    InitializeListHead(&shield::core::TargetProcessListHead);
+    ExInitializeFastMutex(&shield::core::ProcessListMutex);
+    InitializeListHead(&shield::core::LoadedImageListHead);
+    ExInitializeFastMutex(&shield::core::ImageListMutex);
 
-	case IOCTL_PUTIN_SHIELD_STOP_PROTECTION:
+    PsSetCreateProcessNotifyRoutineEx(ProcessCreateNotifyRoutineEx, FALSE);
+    PsSetCreateThreadNotifyRoutine(ThreadNotifyRoutine);
 
-		break;
-
-	default:
-		status = STATUS_INVALID_DEVICE_REQUEST;
-		break;
-	}
-
-	Irp->IoStatus.Status = status;
-	Irp->IoStatus.Information = 0;
-
-	IoCompleteRequest(Irp, IO_NO_INCREMENT);
-
-	return status;
-}
-
-
-NTSTATUS IRPCREATECLOSE(PDEVICE_OBJECT DeviceObject, PIRP Irp)
-{
-	UNREFERENCED_PARAMETER(DeviceObject);
-
-	Irp->IoStatus.Status = STATUS_SUCCESS;
-	Irp->IoStatus.Information = 0;
-
-	IoCompleteRequest(Irp, IO_NO_INCREMENT);
-
-	return STATUS_SUCCESS;
-}
-
-extern "C" NTSTATUS DriverEntry(_In_ PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
-{
-	UNREFERENCED_PARAMETER(RegistryPath);
-	DriverObject->DriverUnload = PutinDriverUnload;
-	KdPrint(("PutinShield.sys load...\n"));
-	
-	UNICODE_STRING deviceName;
-	PDEVICE_OBJECT deviceObject = nullptr;
-
-	RtlInitUnicodeString(&deviceName, L"\\Device\\PutinShield");
-
-	NTSTATUS Device = IoCreateDevice(
-		DriverObject,             
-		sizeof(ULONG),            
-		&deviceName,              
-		FILE_DEVICE_UNKNOWN,      
-		0,                         
-		FALSE,                     
-		&deviceObject              
-	);
-
-	if (!NT_SUCCESS(Device))
-	{
-		return Device;
-	}
-	RtlInitUnicodeString(&symLinkName, L"\\DosDevices\\PutinShieldLink");
-	NTSTATUS symbol = IoCreateSymbolicLink(&symLinkName, &deviceName);
-
-	if (!NT_SUCCESS(symbol))
-	{
-		IoDeleteDevice(deviceObject);
-		return symbol;
-	}
-
-	DriverObject->MajorFunction[IRP_MJ_CREATE] = IRPCREATECLOSE;
-	DriverObject->MajorFunction[IRP_MJ_CLOSE] = IRPCREATECLOSE;
-	DriverObject->MajorFunction[IRP_MJ_DEVICE_CONTROL] = DeviceControl;
-
-	InitializeListHead(&TargetProcessListHead);
-	ExInitializeFastMutex(&ProcessListMutex);
-
-	NTSTATUS PUTIN_REGISTER_CALLBACK = PsSetCreateProcessNotifyRoutineEx(ProcessCreateNotifyRoutineEx, FALSE);
-	NTSTATUS PUTIN_REGISTER_CALLBACK_FOR_THREAD = PsSetCreateThreadNotifyRoutine(ThreadNotifyRoutine);
-	UNICODE_STRING altitude = RTL_CONSTANT_STRING(L"320000");
-	// NTSTATUS status = CmRegisterCallbackEx(RegistryCallback, &altitude, DriverObject, NULL, &g_CallbackRegistrationCookie, NULL);
-
-	if (NT_SUCCESS(PUTIN_REGISTER_CALLBACK) && NT_SUCCESS(PUTIN_REGISTER_CALLBACK_FOR_THREAD))
-	{
-		KdPrint(("PutinShield initialize callbacks success\n"));
-	}
-	else
-	{
-		KdPrint(("PutinShield initialize callback error\n"));
-	}
-	return STATUS_SUCCESS;
+    return STATUS_SUCCESS;
 }
