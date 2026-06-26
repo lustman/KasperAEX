@@ -1,5 +1,4 @@
 #include "PutinShieldTemplate.h"
-#include "dkom.h"
 
 namespace shield::core 
 {
