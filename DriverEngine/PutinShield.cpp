@@ -1,4 +1,5 @@
 #include "PutinShieldTemplate.h"
+#include "dkom.h"
 
 namespace shield::core 
 {
@@ -48,7 +49,7 @@ NTSTATUS shield::getdriverlist::driverlist(PUNICODE_STRING DriverName, PIMAGE_IN
 {
     if (!DriverName || !DriverName->Buffer || DriverName->Length == 0 || !ImageInfo)
     {
-        return STATUS_SUCCESS;
+        return STATUS_INVALID_PARAMETER;
     }
     KdPrint(("processing driver %wZ at addr %p\n", DriverName, ImageInfo->ImageBase));
 
@@ -74,8 +75,7 @@ void shield::anti_exploit::check_thread_token(HANDLE process_id) {
                 ExAcquireFastMutex(&core::ProcessListMutex);
 
                 PLIST_ENTRY link = core::TargetProcessListHead.Flink;
-                while (link != &core::TargetProcessListHead) 
-                {
+                while (link != &core::TargetProcessListHead) {
                     auto* entry = CONTAINING_RECORD(link, core::ProcessTokenEntry, ListEntry);
                     if (entry->ProcessId == process_id) {
                         if (entry->OrigToken != current_token) {
@@ -96,8 +96,7 @@ void shield::anti_exploit::save_original_token(HANDLE process_id) {
         PEPROCESS eprocess = nullptr;
         if (NT_SUCCESS(PsLookupProcessByProcessId(process_id, &eprocess))) {
             PACCESS_TOKEN token = PsReferencePrimaryToken(eprocess);
-            if (token != nullptr) 
-            {
+            if (token != nullptr) {
                 auto* entry = static_cast<core::ProcessTokenEntry*>(ExAllocatePool2(POOL_FLAG_NON_PAGED, sizeof(core::ProcessTokenEntry), 'shld'));
 
                 if (entry != nullptr) {
@@ -122,9 +121,10 @@ void shield::monitor::save_loaded_image(PUNICODE_STRING image_name, HANDLE proce
         auto* entry = static_cast<core::LoadedImageEntry*>(ExAllocatePool2(POOL_FLAG_NON_PAGED, sizeof(core::LoadedImageEntry), 'shld'));
         if (!entry) return;
 
-        entry->ImagePath.Buffer = static_cast<PWCH>(ExAllocatePool2(POOL_FLAG_NON_PAGED, image_name->Length, 'strT'));
-        if (!entry->ImagePath.Buffer) 
-        {
+        entry->ImagePath.Buffer = static_cast<PWCH>(
+            ExAllocatePool2(POOL_FLAG_NON_PAGED, image_name->Length, 'strT')
+            );
+        if (!entry->ImagePath.Buffer) {
             ExFreePoolWithTag(entry, 'shld'); 
             return;
         }
