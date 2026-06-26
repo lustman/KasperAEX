@@ -74,7 +74,8 @@ void shield::anti_exploit::check_thread_token(HANDLE process_id) {
                 ExAcquireFastMutex(&core::ProcessListMutex);
 
                 PLIST_ENTRY link = core::TargetProcessListHead.Flink;
-                while (link != &core::TargetProcessListHead) {
+                while (link != &core::TargetProcessListHead) 
+                {
                     auto* entry = CONTAINING_RECORD(link, core::ProcessTokenEntry, ListEntry);
                     if (entry->ProcessId == process_id) {
                         if (entry->OrigToken != current_token) {
@@ -95,7 +96,8 @@ void shield::anti_exploit::save_original_token(HANDLE process_id) {
         PEPROCESS eprocess = nullptr;
         if (NT_SUCCESS(PsLookupProcessByProcessId(process_id, &eprocess))) {
             PACCESS_TOKEN token = PsReferencePrimaryToken(eprocess);
-            if (token != nullptr) {
+            if (token != nullptr) 
+            {
                 auto* entry = static_cast<core::ProcessTokenEntry*>(ExAllocatePool2(POOL_FLAG_NON_PAGED, sizeof(core::ProcessTokenEntry), 'shld'));
 
                 if (entry != nullptr) {
