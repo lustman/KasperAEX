@@ -1,6 +1,6 @@
 #pragma once
 
-const int BlackListHashes[ 2019 ] = {
+const unsigned int BlackListHashes[ 2019 ] = {
 	0x4A667ACC,				/// 00143c457c8885fd935fc5d5a6ba07a4.bin
 	0x6409E55A,				/// 0023ca0ca16a62d93ef51f3df98b2f94.bin
 	0x57CD1415,				/// 002a58b90a589913a07012253662c98c.bin

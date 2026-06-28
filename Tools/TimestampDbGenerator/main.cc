@@ -61,7 +61,7 @@ void generate_header( const timestamp_array_t& result ) {
 	auto out = std::ofstream( "timestamp_db.h" );
 
 	out << "#pragma once\n\n";
-	out << "const int BlackListHashes[ " << result.size( ) << " ] = {\n";
+	out << "const unsigned int BlackListHashes[ " << result.size( ) << " ] = {\n";
 
 	auto line = std::array<char, 256>( );
 
